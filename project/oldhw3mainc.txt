@@ -1,0 +1,346 @@
+old hw3 main.c
+
+// Copyright (c) 2015-16, Joe Krachey
+// All rights reserved.
+//
+// Redistribution and use in source or binary form, with or without modification, 
+// are permitted provided that the following conditions are met:
+//
+// 1. Redistributions in source form must reproduce the above copyright 
+//    notice, this list of conditions and the following disclaimer in 
+//    the documentation and/or other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" 
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, 
+// THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR 
+// PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR 
+// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, 
+// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, 
+// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; 
+// OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, 
+// WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING 
+// NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, 
+// EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+#include "main.h"
+#include "lcd.h"
+#include "timers.h"
+#include "ps2.h"
+#include "launchpad_io.h"
+#include "HW3_images.h"
+
+char group[] = "00";
+char individual_1[] = "McKinley Sconiers-Hasan";
+char individual_2[] = "Derek DeCramer";
+
+///////////////////////////
+// Global declared next //
+/////////////////////////
+volatile bool debounce_int = false;
+volatile bool joystick_int = false;
+volatile bool timerA_alert = false;		//used for updating missile position and debouncing SW1 for 40ms
+volatile bool timerB_alert = false;		//used for updating plane position and getting ADC values
+uint16_t ps2_x;		//used to get 12bit value from SSFIFO
+uint16_t ps2_y;		//used to get 12bit value from SSFIFO
+
+
+left_right_t joystick_left_right;
+up_down_t joystick_up_down;
+plane_t plane;
+
+struct missle * m_head = NULL;
+struct missle * m_tail = NULL;
+
+typedef enum 
+{
+  DEBOUNCE_ONE,
+  DEBOUNCE_1ST_ZERO,
+  DEBOUNCE_2ND_ZERO,
+  DEBOUNCE_PRESSED
+} DEBOUNCE_STATES;
+
+void DisableInterrupts(void)
+{
+  __asm {
+         CPSID  I
+  }
+}
+
+//*****************************************************************************
+//*****************************************************************************
+void EnableInterrupts(void)
+{
+  __asm {
+    CPSIE  I
+  }
+}
+//toggle red led at 5Hz toggle rate
+//notify main when interrupt occurs via bool variable
+void TIMER0A_Handler(void) {
+	static int count = 0;
+	timerA_alert = true;
+	if(count == 0) {
+		lp_io_set_pin(RED_BIT);
+	}
+	else if(count == 20) {
+		lp_io_clear_pin(RED_BIT);
+	}
+	count = (count + 1) % 40;
+	//clear interrupt
+	TIMER0->ICR |= TIMER_ICR_TATOCINT;
+	return;
+}
+
+
+
+//toggle green led at 2.5Hz toggle rate
+//notify main when interrupt occurs via bool variable
+void TIMER0B_Handler(void) {
+	static int count = 0;
+	timerB_alert = true;
+	if(count == 0) {
+		lp_io_set_pin(GREEN_BIT);
+	}
+	else if(count == 20) {
+		lp_io_clear_pin(GREEN_BIT);
+	}
+	count = (count + 1) % 40;
+	//clear interrupt
+	TIMER0->ICR |= TIMER_ICR_TBTOCINT;
+	return;
+}
+
+void ADC0SS2_Handler(void){
+	//get y value from SSFIFO2
+	ps2_y = (ADC0->SSFIFO2);
+	//get x value from SSFIFO2
+	ps2_x = (ADC0->SSFIFO2);
+	//printf("ps2_x: %x   ", ps2_x);
+	//printf("ps2_y: %x\n", ps2_y);
+	//CLEAR INTERRUPT
+	ADC0->ISC = ADC_ISC_IN2;
+	return;
+}
+
+//*****************************************************************************
+//*****************************************************************************
+//wait for sw1 pin to be low for 40ms before returning true
+bool sw1_debounce_fsm(void)//6D
+{
+  static DEBOUNCE_STATES state = DEBOUNCE_ONE;
+  bool pin_logic_level;
+  
+  pin_logic_level = lp_io_read_pin(SW1_BIT);
+  
+  switch (state)
+  {
+    case DEBOUNCE_ONE:
+    {
+      if(pin_logic_level)
+      {
+        state = DEBOUNCE_ONE;
+      }
+      else
+      {
+        state = DEBOUNCE_1ST_ZERO;
+				while(timerA_alert == false){} //wait 10ms
+				while(timerA_alert == false){} //wait 10ms
+      }
+      break;
+    }
+    case DEBOUNCE_1ST_ZERO:
+    {
+      if(pin_logic_level)
+      {
+        state = DEBOUNCE_ONE;
+      }
+      else
+      {
+        state = DEBOUNCE_2ND_ZERO;
+				while(timerA_alert == false){} //wait 10ms
+				while(timerA_alert == false){} //wait 10ms
+      }
+      break;
+    }
+    case DEBOUNCE_2ND_ZERO:
+    {
+      if(pin_logic_level)
+      {
+        state = DEBOUNCE_ONE;
+      }
+      else
+      {
+        state = DEBOUNCE_PRESSED;
+      }
+      break;
+    }
+    case DEBOUNCE_PRESSED:
+    {
+      if(pin_logic_level)
+      {
+        state = DEBOUNCE_ONE;
+      }
+      else
+      {
+        state = DEBOUNCE_PRESSED;
+      }
+      break;
+    }
+    default:
+    {
+      while(1){};
+    }
+  }
+  
+  if(state == DEBOUNCE_2ND_ZERO )
+  {
+    return true;
+  }
+  else
+  {
+    return false;
+  }
+}
+
+void initialize_hardware(void)
+{
+	
+	initialize_serial_debug();
+	
+	//// setup lcd GPIO, config the screen, and clear it ////
+	gpio_enable_port(PS2_GPIO_BASE);
+	gpio_enable_port(GPIOF_BASE);
+	gpio_config_enable_input(GPIOF_BASE,4);
+	gpio_config_enable_output(GPIOF_BASE, 1);
+	gpio_config_enable_output(GPIOF_BASE, 3);
+	
+	lcd_config_screen();
+	lcd_clear_screen(LCD_COLOR_BLACK);
+
+	//// setup the timers ////
+	gp_timer_config_16(TIMER0_BASE, TIMER_TAMR_TAMR_PERIOD, false, true);
+	
+	//// setup GPIO for LED drive ////
+  lp_io_init();
+	
+	//// Setup ADC to convert on PS2 joystick using SS2 and interrupts ////
+	initialize_adc_new(ADC0_BASE);
+	ps2_initialize();
+}
+
+
+//*****************************************************************************
+//*****************************************************************************
+int 
+main(void)
+{
+	static uint32_t debounce_cnt=0;
+	struct missle* m_curr;
+	
+  initialize_hardware();
+	
+  put_string("\n\r");
+  put_string("************************************\n\r");
+  put_string("ECE353 - Spring 2018 HW3\n\r  ");
+  put_string(group);
+  put_string("\n\r     Name:");
+  put_string(individual_1);
+  put_string("\n\r     Name:");
+  put_string(individual_2);
+  put_string("\n\r");  
+  put_string("************************************\n\r");
+
+	//// Initialize Plane location and image ////
+  plane.x_loc = COLS/2;
+	plane.y_loc = ROWS/2;
+	lcd_draw_image(plane.x_loc,PLANE_WIDTH, plane.y_loc,PLANE_HEIGHT, planeBitmap, LCD_COLOR_RED, LCD_COLOR_BLACK);
+	
+	
+  // Reach infinite loop
+  while(1){
+		//if button pressed, fire missile
+		if(sw1_debounce_fsm()) {//6D
+				struct missle* new_missile = malloc(sizeof(struct missle));
+				new_missile->x_loc = plane.x_loc;
+				new_missile->y_loc = plane.y_loc - PLANE_HEIGHT/2;
+				new_missile->nxt = m_head;
+				m_head = new_missile;
+		}
+			
+			
+		//redraw plane at updated position
+		if(timerB_alert == true){
+			//start conversion for ADC converter
+			kick_off(ADC0_BASE);
+			
+			//LEFT
+			if(ps2_x > .75*0xFFF){
+				if(plane.x_loc - 1 > 0 + PLANE_WIDTH/2)
+					plane.x_loc--;
+			}
+			//RIGHT
+			else if(ps2_x < .25*0xFFF){
+				if(plane.x_loc + 1 < COLS - PLANE_WIDTH/2)
+					plane.x_loc++;
+			}
+			//don't move horizontally
+			else{}
+			//UP
+			if(ps2_y > .75*0xFFF){
+				if(plane.y_loc - 1 > 0 + PLANE_HEIGHT/2)
+					plane.y_loc--;
+			}
+			//DOWN
+			else if(ps2_y < .25*0xFFF){
+				if(plane.y_loc + 1 < ROWS - PLANE_HEIGHT / 2)
+					plane.y_loc++;
+			}
+			//don't move vertically
+			else{}
+			
+			lcd_draw_image(plane.x_loc,PLANE_WIDTH,plane.y_loc,PLANE_HEIGHT, planeBitmap, LCD_COLOR_BLUE2, LCD_COLOR_BLACK);
+			
+			timerB_alert = false;
+		}
+		
+		//iterate through linked list and update missile positions.
+		//delete missiles that fly off the screen.
+		if(timerA_alert){
+			//set up variables for iteration of linked list
+			struct missle* m_prev = NULL;
+			struct missle* m_temp = NULL;
+			m_curr = m_head;
+			
+			while(m_curr != NULL){
+				m_curr->y_loc--;
+				lcd_draw_image(m_curr->x_loc, MISSLE_WIDTH, m_curr->y_loc, MISSLE_HEIGHT, missleBitmap, LCD_COLOR_YELLOW, LCD_COLOR_BLACK);
+				//if missile is off top of screen
+				if(m_curr->y_loc < -5){
+					//remove missile from linked list and reset head
+					if(m_prev == NULL){
+						m_temp = m_head;
+						m_head = m_head->nxt;
+						m_curr = m_head;
+						free(m_temp);	//free missile memory
+						break;
+					}
+					//remove missile from linked list
+					else{
+						m_temp = m_prev->nxt;
+						m_prev->nxt = m_curr->nxt;
+						m_curr = m_prev->nxt;
+						free(m_temp); //free missile memory
+						break;
+					}
+				}
+				//keep track of previous missile to help with removing from linked list
+				m_prev = m_curr;
+				m_curr = m_curr->nxt;
+			}
+			timerA_alert = false;
+		}
+		
+  }		// end of while(1) loop
+}
+
+
